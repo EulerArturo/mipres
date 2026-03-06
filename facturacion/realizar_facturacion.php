@@ -68,7 +68,84 @@ function registrar_facturacion_log($pdo, $facturacionId, $usuarioId, $accion, $d
     }
 }
 
-if (isset($_GET['source_id']) && is_numeric($_GET['source_id'])) {
+function ensure_facturacion_candidatos_table($pdo)
+{
+    $pdo->exec("CREATE TABLE IF NOT EXISTS facturacion_candidatos (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        source_tipo ENUM('ENTREGA','REPORTE_ENTREGA') NOT NULL,
+        source_id INT NOT NULL,
+        source_fecha DATETIME NULL,
+        no_prescripcion VARCHAR(20) DEFAULT NULL,
+        tipo_tec VARCHAR(1) DEFAULT NULL,
+        con_tec VARCHAR(2) DEFAULT NULL,
+        tipo_id_paciente VARCHAR(2) DEFAULT NULL,
+        no_id_paciente VARCHAR(17) DEFAULT NULL,
+        no_entrega VARCHAR(4) DEFAULT NULL,
+        no_sub_entrega VARCHAR(2) DEFAULT NULL,
+        no_factura VARCHAR(96) DEFAULT NULL,
+        no_id_eps VARCHAR(17) DEFAULT NULL,
+        cod_eps VARCHAR(6) DEFAULT NULL,
+        cod_ser_tec_entregado VARCHAR(20) DEFAULT NULL,
+        cant_un_min_dis DECIMAL(16,4) DEFAULT NULL,
+        valor_unit_facturado DECIMAL(16,2) DEFAULT NULL,
+        valor_tot_facturado DECIMAL(16,2) DEFAULT NULL,
+        cuota_moderadora DECIMAL(16,2) DEFAULT 0.00,
+        copago DECIMAL(16,2) DEFAULT 0.00,
+        dir_paciente VARCHAR(80) DEFAULT NULL,
+        campos_faltantes TEXT,
+        porcentaje_completitud INT DEFAULT 0,
+        semaforo VARCHAR(10) DEFAULT 'ROJO',
+        estado VARCHAR(20) DEFAULT 'pendiente',
+        facturacion_id INT NULL,
+        fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uq_source (source_tipo, source_id),
+        INDEX idx_estado (estado),
+        INDEX idx_semaforo (semaforo),
+        INDEX idx_completitud (porcentaje_completitud)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+}
+
+$candidateId = 0;
+
+if (isset($_GET['candidate_id']) && is_numeric($_GET['candidate_id'])) {
+    $candidateId = (int) $_GET['candidate_id'];
+
+    try {
+        ensure_facturacion_candidatos_table($pdo);
+        $stmt = $pdo->prepare('SELECT * FROM facturacion_candidatos WHERE id = ? LIMIT 1');
+        $stmt->execute([$candidateId]);
+        $candidate = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($candidate) {
+            $datosFormulario['no_prescripcion'] = $candidate['no_prescripcion'] ?? '';
+            $datosFormulario['tipo_tec'] = $candidate['tipo_tec'] ?: $datosFormulario['tipo_tec'];
+            $datosFormulario['con_tec'] = $candidate['con_tec'] ?? '';
+            $datosFormulario['tipo_id_paciente'] = $candidate['tipo_id_paciente'] ?? '';
+            $datosFormulario['no_id_paciente'] = $candidate['no_id_paciente'] ?? '';
+            $datosFormulario['no_entrega'] = $candidate['no_entrega'] ?? '';
+            $datosFormulario['no_sub_entrega'] = $candidate['no_sub_entrega'] ?? '';
+            $datosFormulario['no_factura'] = $candidate['no_factura'] ?? '';
+            $datosFormulario['no_id_eps'] = $candidate['no_id_eps'] ?: $datosFormulario['no_id_eps'];
+            $datosFormulario['cod_eps'] = $candidate['cod_eps'] ?? '';
+            $datosFormulario['cod_ser_tec_entregado'] = $candidate['cod_ser_tec_entregado'] ?? '';
+            $datosFormulario['cant_un_min_dis'] = $candidate['cant_un_min_dis'] ?? '0';
+            $datosFormulario['valor_unit_facturado'] = $candidate['valor_unit_facturado'] ?? '0';
+            $datosFormulario['valor_tot_facturado'] = $candidate['valor_tot_facturado'] ?? '0';
+            $datosFormulario['cuota_moderadora'] = $candidate['cuota_moderadora'] ?? '0';
+            $datosFormulario['copago'] = $candidate['copago'] ?? '0';
+            $datosFormulario['dir_paciente'] = $candidate['dir_paciente'] ?? '';
+
+            $mensaje = 'Prellenado automatico aplicado desde candidato #' . $candidateId . '. Revise campos faltantes antes de guardar.';
+            $tipo_mensaje = 'warning';
+        }
+    } catch (PDOException $e) {
+        $mensaje = 'No fue posible cargar el candidato de facturacion.';
+        $tipo_mensaje = 'error';
+    }
+}
+
+if ($candidateId === 0 && isset($_GET['source_id']) && is_numeric($_GET['source_id'])) {
     $sourceId = (int) $_GET['source_id'];
 
     try {
@@ -98,6 +175,8 @@ if (isset($_GET['source_id']) && is_numeric($_GET['source_id'])) {
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['enviar_facturacion'])) {
+    $candidateId = (int) ($_POST['candidate_id'] ?? 0);
+
     foreach ($datosFormulario as $campo => $valor) {
         $datosFormulario[$campo] = trim($_POST[$campo] ?? $valor);
     }
@@ -176,6 +255,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['enviar_facturacion'])
             $facturacionId = (int) $pdo->lastInsertId();
             registrar_facturacion_log($pdo, $facturacionId, $usuario['id'], 'CREAR', 'Facturacion creada en estado pendiente');
             registrar_log_actividad($pdo, $usuario['id'], 'FACTURACION_CREAR', 'Facturacion #' . $facturacionId . ' creada');
+
+            if ($candidateId > 0) {
+                try {
+                    ensure_facturacion_candidatos_table($pdo);
+                    $pdo->prepare('UPDATE facturacion_candidatos SET estado = ?, facturacion_id = ? WHERE id = ?')
+                        ->execute(['convertida', $facturacionId, $candidateId]);
+                } catch (PDOException $e) {
+                    // No romper flujo por falla de marcacion de candidato
+                }
+            }
 
             if ($enviarApi) {
                 if ($tokenTemporal === '') {
@@ -285,6 +374,7 @@ $tokenTemporalVista = $_SESSION['token_temporal'] ?? '';
 
                 <form method="POST" action="">
                     <input type="hidden" name="enviar_api" id="enviar-api" value="0">
+                    <input type="hidden" name="candidate_id" value="<?php echo (int) $candidateId; ?>">
 
                     <div class="grid-2">
                         <div class="form-group">
