@@ -454,6 +454,7 @@ registrar_log_actividad($pdo, $usuario['id'], 'CONSULTAR_INFORMES', 'Acceso a m√
                             <th>Cantidad</th>
                             <th>Lote</th>
                             <th>Fecha y Hora</th>
+                            <th>Facturaci√≥n</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -465,6 +466,9 @@ registrar_log_actividad($pdo, $usuario['id'], 'CONSULTAR_INFORMES', 'Acceso a m√
                                 <td><?php echo htmlspecialchars($entrega['cantidad_entregada']); ?></td>
                                 <td><?php echo htmlspecialchars($entrega['lote'] ?? '-'); ?></td>
                                 <td><?php echo date('d/m/Y H:i:s', strtotime($entrega['fecha_registro'])); ?></td>
+                                <td>
+                                    <a href="../facturacion/realizar_facturacion.php?source_id=<?php echo urlencode($entrega['id']); ?>&tipo_tec=M">Prellenar</a>
+                                </td>
                             </tr>
                         <?php endforeach; ?>
                     </tbody>
@@ -494,6 +498,7 @@ registrar_log_actividad($pdo, $usuario['id'], 'CONSULTAR_INFORMES', 'Acceso a m√
                             <th>Estado Entrega</th>
                             <th>Valor Entregado</th>
                             <th>Fecha y Hora</th>
+                            <th>Facturaci√≥n</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -505,6 +510,9 @@ registrar_log_actividad($pdo, $usuario['id'], 'CONSULTAR_INFORMES', 'Acceso a m√
                                 <td><?php echo htmlspecialchars($reporte['estado_entrega']); ?></td>
                                 <td><?php echo htmlspecialchars($reporte['valor_entregado'] ?? '-'); ?></td>
                                 <td><?php echo date('d/m/Y H:i:s', strtotime($reporte['fecha_registro'])); ?></td>
+                                <td>
+                                    <a href="../facturacion/realizar_facturacion.php?source_id=<?php echo urlencode($reporte['id']); ?>&tipo_tec=M">Prellenar</a>
+                                </td>
                             </tr>
                         <?php endforeach; ?>
                     </tbody>

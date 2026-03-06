@@ -118,7 +118,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['enviar_entrega'])) {
                     ");
                     $stmt_prescripcion->execute([$entrega['ID']]);
                     $result_prescripcion = $stmt_prescripcion->fetch(PDO::FETCH_ASSOC);
-                    $no_prescripcion_real = $entrega['NoPrescripcion'] ?? '';
+                    $no_prescripcion_real = $result_prescripcion['no_prescripcion'] ?? ($entrega['NoPrescripcion'] ?? '');
 
                     
                     $stmt = $pdo->prepare("
