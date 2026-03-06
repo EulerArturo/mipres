@@ -1,0 +1,9 @@
+# Proteger el directorio de configuración
+Order Deny,Allow
+Deny from all
+
+# Permitir solo acceso desde el servidor
+<FilesMatch "\.php$">
+    Order Allow,Deny
+    Deny from all
+</FilesMatch>
