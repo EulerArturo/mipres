@@ -74,15 +74,37 @@ function ensure_facturacion_candidatos_table($pdo)
         campos_faltantes TEXT,
         porcentaje_completitud INT DEFAULT 0,
         semaforo VARCHAR(10) DEFAULT 'ROJO',
+        llave_funcional VARCHAR(255) DEFAULT NULL,
         estado VARCHAR(20) DEFAULT 'pendiente',
         facturacion_id INT NULL,
+        candidato_principal_id INT NULL,
+        motivo_descarte VARCHAR(255) DEFAULT NULL,
         fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         UNIQUE KEY uq_source (source_tipo, source_id),
         INDEX idx_estado (estado),
         INDEX idx_semaforo (semaforo),
-        INDEX idx_completitud (porcentaje_completitud)
+        INDEX idx_completitud (porcentaje_completitud),
+        INDEX idx_llave_funcional (llave_funcional),
+        INDEX idx_candidato_principal_id (candidato_principal_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+
+    // Compatibilidad con instalaciones que ya tenian la tabla creada sin las columnas nuevas
+    $alterStatements = [
+        "ALTER TABLE facturacion_candidatos ADD COLUMN llave_funcional VARCHAR(255) DEFAULT NULL",
+        "ALTER TABLE facturacion_candidatos ADD COLUMN candidato_principal_id INT NULL",
+        "ALTER TABLE facturacion_candidatos ADD COLUMN motivo_descarte VARCHAR(255) DEFAULT NULL",
+        "ALTER TABLE facturacion_candidatos ADD INDEX idx_llave_funcional (llave_funcional)",
+        "ALTER TABLE facturacion_candidatos ADD INDEX idx_candidato_principal_id (candidato_principal_id)",
+    ];
+
+    foreach ($alterStatements as $sql) {
+        try {
+            $pdo->exec($sql);
+        } catch (PDOException $e) {
+            // Ignorar si ya existe columna/indice
+        }
+    }
 }
 
 function to_decimal($value)
@@ -149,6 +171,89 @@ function calcular_completitud_candidato($data)
     ];
 }
 
+function construir_llave_funcional($data)
+{
+    $noPrescripcion = trim((string) ($data['no_prescripcion'] ?? ''));
+    $tipoIdPaciente = strtoupper(trim((string) ($data['tipo_id_paciente'] ?? '')));
+    $noIdPaciente = trim((string) ($data['no_id_paciente'] ?? ''));
+    $codServicio = strtoupper(trim((string) ($data['cod_ser_tec_entregado'] ?? '')));
+    $noEntrega = trim((string) ($data['no_entrega'] ?? ''));
+    $entregaRef = trim((string) ($data['entrega_ref'] ?? ''));
+    $entregaFuncional = $noEntrega !== '' ? $noEntrega : $entregaRef;
+
+    if ($noPrescripcion === '' || $tipoIdPaciente === '' || $noIdPaciente === '' || $codServicio === '' || $entregaFuncional === '') {
+        return '';
+    }
+
+    return implode('|', [$noPrescripcion, $tipoIdPaciente, $noIdPaciente, $codServicio, $entregaFuncional]);
+}
+
+function aplicar_regla_duplicados_funcionales($pdo)
+{
+    // Recalcular duplicados en cada sincronizacion: lo descartado vuelve a pendiente y se reevalua.
+    $pdo->exec("UPDATE facturacion_candidatos SET estado = 'pendiente', candidato_principal_id = NULL, motivo_descarte = NULL WHERE estado = 'descartado_duplicado'");
+
+    $stmt = $pdo->query("SELECT llave_funcional FROM facturacion_candidatos WHERE llave_funcional IS NOT NULL AND llave_funcional <> '' GROUP BY llave_funcional HAVING COUNT(*) > 1");
+    $llaves = $stmt->fetchAll(PDO::FETCH_COLUMN);
+
+    if (empty($llaves)) {
+        return 0;
+    }
+
+    $descartados = 0;
+    $updDescartar = $pdo->prepare("UPDATE facturacion_candidatos SET estado = 'descartado_duplicado', candidato_principal_id = ?, motivo_descarte = ? WHERE id = ? AND estado <> 'convertida'");
+    $updPrincipal = $pdo->prepare("UPDATE facturacion_candidatos SET candidato_principal_id = NULL, motivo_descarte = NULL WHERE id = ?");
+
+    foreach ($llaves as $llave) {
+        $rowsStmt = $pdo->prepare("SELECT id, estado, porcentaje_completitud, source_fecha, fecha_actualizacion FROM facturacion_candidatos WHERE llave_funcional = ? ORDER BY id DESC");
+        $rowsStmt->execute([$llave]);
+        $rows = $rowsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+        if (count($rows) < 2) {
+            continue;
+        }
+
+        usort($rows, function ($a, $b) {
+            $pesoA = ($a['estado'] === 'convertida') ? 3 : (($a['estado'] === 'pendiente') ? 2 : 1);
+            $pesoB = ($b['estado'] === 'convertida') ? 3 : (($b['estado'] === 'pendiente') ? 2 : 1);
+            if ($pesoA !== $pesoB) {
+                return $pesoB <=> $pesoA;
+            }
+
+            $compA = (int) ($a['porcentaje_completitud'] ?? 0);
+            $compB = (int) ($b['porcentaje_completitud'] ?? 0);
+            if ($compA !== $compB) {
+                return $compB <=> $compA;
+            }
+
+            $fechaA = strtotime((string) ($a['source_fecha'] ?: $a['fecha_actualizacion']));
+            $fechaB = strtotime((string) ($b['source_fecha'] ?: $b['fecha_actualizacion']));
+            if ($fechaA !== $fechaB) {
+                return $fechaB <=> $fechaA;
+            }
+
+            return ((int) $b['id']) <=> ((int) $a['id']);
+        });
+
+        $principalId = (int) $rows[0]['id'];
+        $updPrincipal->execute([$principalId]);
+
+        for ($i = 1; $i < count($rows); $i++) {
+            $dupId = (int) $rows[$i]['id'];
+            $updDescartar->execute([
+                $principalId,
+                'Duplicado funcional de candidato #' . $principalId,
+                $dupId,
+            ]);
+            if ($updDescartar->rowCount() > 0) {
+                $descartados++;
+            }
+        }
+    }
+
+    return $descartados;
+}
+
 function sincronizar_candidatos_facturacion($pdo)
 {
     ensure_facturacion_candidatos_table($pdo);
@@ -163,14 +268,14 @@ function sincronizar_candidatos_facturacion($pdo)
             no_entrega, no_sub_entrega, no_factura, no_id_eps, cod_eps,
             cod_ser_tec_entregado, cant_un_min_dis, valor_unit_facturado, valor_tot_facturado,
             cuota_moderadora, copago, dir_paciente,
-            campos_faltantes, porcentaje_completitud, semaforo, estado
+            campos_faltantes, porcentaje_completitud, semaforo, llave_funcional, estado
         ) VALUES (
             ?, ?, ?,
             ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?, ?,
-            ?, ?, ?, 'pendiente'
+            ?, ?, ?, ?, 'pendiente'
         )
         ON DUPLICATE KEY UPDATE
             source_fecha = VALUES(source_fecha),
@@ -194,6 +299,7 @@ function sincronizar_candidatos_facturacion($pdo)
             campos_faltantes = VALUES(campos_faltantes),
             porcentaje_completitud = VALUES(porcentaje_completitud),
             semaforo = VALUES(semaforo),
+                llave_funcional = VALUES(llave_funcional),
             estado = CASE WHEN estado = 'convertida' THEN estado ELSE 'pendiente' END,
             facturacion_id = CASE WHEN estado = 'convertida' THEN facturacion_id ELSE NULL END"
     );
@@ -207,8 +313,10 @@ function sincronizar_candidatos_facturacion($pdo)
         $valorUnit = ($cantidad > 0 && $valorTotal > 0) ? round($valorTotal / $cantidad, 2) : 0.0;
 
         $noEntrega = '';
+        $entregaRef = '';
         if ($tipo === 'REPORTE_ENTREGA') {
             $idEntrega = trim((string) ($r['id_entrega'] ?? ''));
+            $entregaRef = $idEntrega;
             if ($idEntrega !== '' && strlen($idEntrega) <= 4) {
                 $noEntrega = $idEntrega;
             }
@@ -221,6 +329,7 @@ function sincronizar_candidatos_facturacion($pdo)
             'tipo_id_paciente' => trim((string) ($r['tipo_id_recibe'] ?? '')),
             'no_id_paciente' => trim((string) ($r['numero_id_recibe'] ?? '')),
             'no_entrega' => $noEntrega,
+            'entrega_ref' => $entregaRef,
             'no_sub_entrega' => '',
             'no_factura' => '',
             'no_id_eps' => trim((string) ($r['nit'] ?? '')),
@@ -235,6 +344,7 @@ function sincronizar_candidatos_facturacion($pdo)
         ];
 
         $completitud = calcular_completitud_candidato($data);
+        $llaveFuncional = construir_llave_funcional($data);
 
         $upsert->execute([
             $tipo,
@@ -260,12 +370,18 @@ function sincronizar_candidatos_facturacion($pdo)
             implode(', ', $completitud['faltantes']),
             $completitud['porcentaje'],
             $completitud['semaforo'],
+            $llaveFuncional,
         ]);
 
         $procesados++;
     }
 
-    return $procesados;
+    $descartados = aplicar_regla_duplicados_funcionales($pdo);
+
+    return [
+        'procesados' => $procesados,
+        'descartados_duplicado' => $descartados,
+    ];
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['reenviar_api'])) {
@@ -336,10 +452,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['reenviar_api'])) {
 }
 
 $syncProcesados = 0;
+$syncDescartados = 0;
 try {
-    $syncProcesados = sincronizar_candidatos_facturacion($pdo);
+    $syncResult = sincronizar_candidatos_facturacion($pdo);
+    $syncProcesados = (int) ($syncResult['procesados'] ?? 0);
+    $syncDescartados = (int) ($syncResult['descartados_duplicado'] ?? 0);
+
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['sincronizar_candidatos'])) {
-        $mensaje = 'Sincronizacion completada. Registros revisados: ' . $syncProcesados;
+        $mensaje = 'Sincronizacion completada. Registros revisados: ' . $syncProcesados . '. Duplicados descartados: ' . $syncDescartados;
         $tipo_mensaje = 'success';
     }
 } catch (PDOException $e) {
@@ -394,6 +514,14 @@ if ($semaforo !== '') {
 if ($noPrescripcion !== '') {
     $sqlCand .= ' AND no_prescripcion LIKE ?';
     $paramsCand[] = '%' . $noPrescripcion . '%';
+}
+if ($fechaInicio !== '') {
+    $sqlCand .= ' AND DATE(source_fecha) >= ?';
+    $paramsCand[] = $fechaInicio;
+}
+if ($fechaFin !== '') {
+    $sqlCand .= ' AND DATE(source_fecha) <= ?';
+    $paramsCand[] = $fechaFin;
 }
 $sqlCand .= " ORDER BY CASE semaforo WHEN 'ROJO' THEN 1 WHEN 'AMARILLO' THEN 2 ELSE 3 END, porcentaje_completitud DESC, id DESC LIMIT 500";
 $stmtCand = $pdo->prepare($sqlCand);
@@ -453,7 +581,7 @@ registrar_log_actividad($pdo, $usuario['id'], 'CONSULTAR_FACTURACION', 'Acceso a
         <main class="main-content">
             <div class="card">
                 <h2>Candidatos automaticos de facturacion</h2>
-                <p class="card-subtitle">Sincronizados desde entregas/reportes exitosos. Revisados en esta carga: <?php echo (int) $syncProcesados; ?></p>
+                <p class="card-subtitle">Sincronizados desde entregas/reportes exitosos. Revisados: <?php echo (int) $syncProcesados; ?>. Duplicados descartados: <?php echo (int) $syncDescartados; ?>.</p>
 
                 <?php if ($mensaje !== ''): ?>
                     <div class="alert alert-<?php echo htmlspecialchars($tipo_mensaje); ?>">
@@ -481,7 +609,7 @@ registrar_log_actividad($pdo, $usuario['id'], 'CONSULTAR_FACTURACION', 'Acceso a
                     </select>
                     <select name="estado_candidato">
                         <option value="">Estado cand. (todos)</option>
-                        <?php foreach (['pendiente','convertida'] as $ec): ?>
+                        <?php foreach (['pendiente','convertida','descartado_duplicado'] as $ec): ?>
                             <option value="<?php echo $ec; ?>" <?php echo $estadoCandidato === $ec ? 'selected' : ''; ?>><?php echo ucfirst($ec); ?></option>
                         <?php endforeach; ?>
                     </select>
@@ -501,6 +629,7 @@ registrar_log_actividad($pdo, $usuario['id'], 'CONSULTAR_FACTURACION', 'Acceso a
                                 <th>Paciente</th>
                                 <th>Servicio/Cant.</th>
                                 <th>Total</th>
+                                <th>Estado</th>
                                 <th>Completitud</th>
                                 <th>Faltantes</th>
                                 <th>Accion</th>
@@ -508,7 +637,7 @@ registrar_log_actividad($pdo, $usuario['id'], 'CONSULTAR_FACTURACION', 'Acceso a
                         </thead>
                         <tbody>
                             <?php if (empty($candidatos)): ?>
-                                <tr><td colspan="10" style="text-align:center; padding:16px;">Sin candidatos para los filtros actuales</td></tr>
+                                <tr><td colspan="11" style="text-align:center; padding:16px;">Sin candidatos para los filtros actuales</td></tr>
                             <?php else: ?>
                                 <?php foreach ($candidatos as $cand): ?>
                                     <?php
@@ -523,12 +652,22 @@ registrar_log_actividad($pdo, $usuario['id'], 'CONSULTAR_FACTURACION', 'Acceso a
                                         <td><?php echo htmlspecialchars(trim((string) $cand['tipo_id_paciente'] . ' ' . (string) $cand['no_id_paciente'])); ?></td>
                                         <td><?php echo htmlspecialchars((string) $cand['cod_ser_tec_entregado'] . ' / ' . (string) $cand['cant_un_min_dis']); ?></td>
                                         <td><?php echo htmlspecialchars((string) $cand['valor_tot_facturado']); ?></td>
+                                        <td><?php echo htmlspecialchars((string) $cand['estado']); ?></td>
                                         <td>
                                             <span class="badge <?php echo $badgeClass; ?>"><?php echo htmlspecialchars($sem . ' ' . (int) $cand['porcentaje_completitud'] . '%'); ?></span>
                                         </td>
-                                        <td style="max-width:240px; white-space:normal;"><?php echo htmlspecialchars((string) $cand['campos_faltantes']); ?></td>
+                                        <td style="max-width:240px; white-space:normal;">
+                                            <?php echo htmlspecialchars((string) $cand['campos_faltantes']); ?>
+                                            <?php if (!empty($cand['motivo_descarte'])): ?>
+                                                <br><small><?php echo htmlspecialchars((string) $cand['motivo_descarte']); ?></small>
+                                            <?php endif; ?>
+                                        </td>
                                         <td>
-                                            <a class="btn" href="realizar_facturacion.php?candidate_id=<?php echo (int) $cand['id']; ?>">Prellenar</a>
+                                            <?php if ($cand['estado'] === 'pendiente'): ?>
+                                                <a class="btn" href="realizar_facturacion.php?candidate_id=<?php echo (int) $cand['id']; ?>">Prellenar</a>
+                                            <?php else: ?>
+                                                --
+                                            <?php endif; ?>
                                         </td>
                                     </tr>
                                 <?php endforeach; ?>

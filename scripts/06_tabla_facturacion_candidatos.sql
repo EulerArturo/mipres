@@ -28,12 +28,17 @@ CREATE TABLE IF NOT EXISTS facturacion_candidatos (
     campos_faltantes TEXT,
     porcentaje_completitud INT DEFAULT 0,
     semaforo VARCHAR(10) DEFAULT 'ROJO',
+    llave_funcional VARCHAR(255) DEFAULT NULL,
     estado VARCHAR(20) DEFAULT 'pendiente',
     facturacion_id INT NULL,
+    candidato_principal_id INT NULL,
+    motivo_descarte VARCHAR(255) DEFAULT NULL,
     fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uq_source (source_tipo, source_id),
     INDEX idx_estado (estado),
     INDEX idx_semaforo (semaforo),
-    INDEX idx_completitud (porcentaje_completitud)
+    INDEX idx_completitud (porcentaje_completitud),
+    INDEX idx_llave_funcional (llave_funcional),
+    INDEX idx_candidato_principal_id (candidato_principal_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
